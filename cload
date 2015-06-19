@@ -2,3 +2,164 @@
 -- by ardera
 -- my entry for CCJam 2015
 
+local preloads = {
+	classes = {},
+	directories = {},
+	archives = {},
+	assets = {},
+	metainf = nil
+}
+local cmap = {}
+local state = 0 -- 0=none; 1=loading; 2=loaded; 3=running; 4=stopped
+local meta = {
+	MAIN = "one.Main" -- one = objective native environment
+}
+
+-- private functions / internals
+local loadClassInternal, loadAssetInternal, loadDirectoryInternal, loadArchiveInternal, loadInternal, exportInternal, runInternal, err, ass, isFile, isDir, readFile
+
+function err(msg, level)
+	state = 4
+	error(msg, (level or 1)+1)
+end
+function ass(cond, msg, level)
+	if not cond then
+		state = 4
+		error(msg, (level or 1)+1)
+	end
+	return cond
+end
+function isFile(p)
+	return fs.exists(p) and not fs.isDir(p)
+end
+function isDir(p)
+	return fs.isDir(p)
+end
+function readFile(p)
+	local r = fs.open(p, "r")
+	if not r then err("Could not read file: "..p, 2) end
+	local c = r.readAll()
+	r.close()
+	return c
+end
+
+
+-- these functions are not used in the "loading" sequence; everything's loaded together in the "loaded" sequence
+function loadClassInternal(path)
+	print("loadClassInternal: ", path)
+end
+function loadAssetInternal(path)
+	err("Operation not supported: loadAssetInternal", 2)
+end
+function loadDirectoryInternal(path)
+	ass(fs.exists(path) and fs.isDir(path), "directory argument is not an existing directory: "..path, 2)
+	for _, n in pairs(fs.list(path)) do
+		if not fs.isDir(n) then
+			loadClassInternal(n)
+		else
+			loadDirectoryInternal(n)
+		end
+	end
+end
+function loadArchiveInternal(path)
+	err("Operation not supported: loadArchiveInternal", 2)
+end
+function loadMetainfInternal(path)
+	ass(isFile(path), "metainf argument is not an existing file: "..path, 2)
+	local metainf = textutils.unserialize(readFile(path))
+	if type(metainf.MAIN) == "string" then
+		meta.MAIN = metainf.MAIN
+	end
+end
+
+function loadInternal()
+	for path, _ in pairs(preloads.classes) do
+		loadClassInternal(path)
+	end
+	for path, _ in pairs(preloads.directories) do
+		loadDirectoryInternal(path)
+	end
+	for path, _ in pairs(preloads.archives) do
+		loadArchiveInternal(path)
+	end
+	for path, _ in pairs(preloads.assets) do
+		loadAssetInternal(path)
+	end
+	loadMetainfInternal(path)
+end
+
+function exportInternal()
+	err("Operation not supported: exportInternal", 2)
+end
+
+function runInternal()
+	err("Operation not supported: runInternal", 2)
+end
+
+
+
+
+-- public functions
+
+local root = "/"
+
+-- state = 1
+function startLoading(nroot)
+	assert(state == 0, "state ~= none", 2)
+	assert(type(nroot) == "string" or root == nil, "argument #1: string or nil expected")
+	state = 1
+	root = nroot or "/"
+end
+
+function loadClass(rpath)
+	assert(state == 1, "state ~= loading", 2)
+	assert(type(rpath) == "string", "argument #1: string expected", 2)
+	local path = fs.combine(root, rpath)
+	preloads.classes[path] = true
+end
+function loadAsset(rpath)
+	assert(state == 1, "state ~= loading", 2)
+	assert(type(rpath) == "string", "argument #1: string expected", 2)
+	local path = fs.combine(root, rpath)
+	preloads.assets[path] = true
+end
+function loadDirectory(rpath)
+	assert(state == 1, "state ~= loading", 2)
+	assert(type(rpath) == "string" or rpath == nil, "argument #1: string expected", 2)
+	local path = fs.combine(root, rpath or "/")
+	preloads.directories[path] = true
+end
+function loadArchive(rpath)
+	assert(state == 1, "state ~= loading", 2)
+	assert(type(rpath) == "string", "argument #1: string expected", 2)
+	local path = fs.combine(root, rpath)
+	preloads.archives[path] = true
+end
+function loadMetainf(rpath)
+	assert(state == 1, "state ~= loading", 2)
+	assert(type(rpath) == "string", "argument #1: string expected", 2)
+	local path = fs.combine(root, rpath)
+	preloads.metainf = path
+end
+
+-- state = 2
+function load()
+	assert(state == 1, "state ~= loading", 2)
+	state = 2
+	
+	loadInternal()
+end
+
+function export(path)
+	assert(state == 2, "state ~= loaded", 2)
+	
+	exportInternal(path) -- no relative path here
+end
+
+-- state = 3
+function run()
+	assert(state == 2, "state ~= loaded", 2)
+	state = 3
+	
+	runInternal()
+end

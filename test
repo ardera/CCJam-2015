@@ -1,0 +1,8 @@
+os.loadAPI "cload"
+cload.startLoading "/classes/"
+
+cload.loadDirectory()
+
+cload.load()
+cload.export "/archive.oba"
+cload.run()
