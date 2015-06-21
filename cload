@@ -2,6 +2,28 @@
 -- by ardera
 -- my entry for CCJam 2015
 
+local logpath = "/log.txt"
+do
+	local logw_ = fs.open(logpath, "w")
+	logw_.close()
+end
+local function log(...)
+	local args = {...}
+	local str = ""
+	for a = 1, #args do
+		str = str .. tostring(args[a])
+	end
+
+	local w = fs.open(logpath, "a")
+	w.writeLine(str)
+	w.close()
+	return ...
+end
+local function logp(...)
+	print(...)
+	return log(...)
+end
+
 local preloads = {
 	classes = {},
 	directories = {},
@@ -10,27 +32,36 @@ local preloads = {
 	metainf = nil
 }
 local cmap = {}
+local ctree = {}
 local state = 0 -- 0=none; 1=loading; 2=loaded; 3=running; 4=stopped
 local meta = {
 	MAIN = "one.Main" -- one = objective native environment
 }
 
 -- private functions / internals
-local loadClassInternal, loadAssetInternal, loadDirectoryInternal, loadArchiveInternal, loadInternal, exportInternal, runInternal, err, ass, isFile, isDir, readFile
+local loadClassInternal, loadAssetInternal, loadDirectoryInternal, loadArchiveInternal,
+	loadInternal, exportInternal, runInternal, err, ass, isFile, isDir, readFile, loadClassSpecs,
+	invokeMethod, buildMethodEnv, checkType, checkArgs, getClassAccessor, getStaticClassAccessor,
+	setMethodEnv, invokeMethodEnv
 
 function err(msg, level)
 	state = 4
+	log(msg)
 	error(msg, (level or 1)+1)
 end
 function ass(cond, msg, level)
 	if not cond then
 		state = 4
+		log(msg)
 		error(msg, (level or 1)+1)
 	end
 	return cond
 end
 function isFile(p)
-	return fs.exists(p) and not fs.isDir(p)
+	if type(p) == "string" then
+		return fs.exists(p) and not fs.isDir(p)
+	end
+	return false
 end
 function isDir(p)
 	return fs.isDir(p)
@@ -43,10 +74,492 @@ function readFile(p)
 	return c
 end
 
+local temp_setMethodEnv = {}
+function setMethodEnv(classpath, fieldname, env)
+	if not temp_setMethodEnv[classpath] then
+		temp_setMethodEnv[classpath] = {}
+	end
+	if temp_setMethodEnv[classpath] == env then
+		return
+	end
+
+	setfenv(cmap[classpath].methods[fieldname].value, buildMethodEnv(classpath))
+	temp_setMethodEnv[classpath][fieldname] = env
+end
+
+function invokeMethod(classpath, fieldname, arguments)
+
+end
+function invokeMethodEnv(classpath, fieldname, arguments)
+	setMethodEnv(classpath, fieldname, buildMethodEnv(classpath))
+	return invokeMethod(classpath, fieldname, arguments)
+end
+
+local temp_buildMethodEnv = {}
+function buildMethodEnv(classpath)
+	if temp_buildMethodEnv[classpath] then
+		return temp_buildMethodEnv[classpath]
+	end
+	local c = cmap[classpath]
+	local path = ""
+	local tab = ctree
+	local function classTreeHook(k)
+		if path ~= "" then
+			path = "."
+		end
+		path = path .. k
+		return setmetatable({}, {
+			__newindex = function() end,
+			__index = function(t, k)
+				if tab[k] and tab[k].methods then
+					local acc = getStaticClassAccessor(path)
+					path = ""
+					tab = ctree
+					return acc
+				elseif tab[k] then
+					return classTreeHook(k)
+				end
+			end
+		})
+	end
+
+	local env = setmetatable({}, {
+		__index = function(t, k)
+			if c.invimport[k] then
+				return getStaticClassAccessor(c.invimport[k])
+			elseif ctree[k] then
+				path = ""
+				tab = ctree
+				return classTreeHook(k)
+			end
+		end,
+		__newindex = function(t, k, v)
+		end
+	})
+end
+
+local temp_getClassAccessor = {}
+function getClassAccessor(classpath, classpath2)
+
+end
+local temp_getStaticFields = {}
+function getStaticFields(classpath) -- includes methods
+
+end
+
+local temp_getStaticClassAccessor = {}
+function getStaticClassAccessor(classpath)
+	if temp_getStaticClassAccessor[classpath] then
+		return temp_getStaticClassAccessor[classpath]
+	end
+	local staticf = getStaticFields(classpath)
+	return setmetatable({}, {
+		__newindex = function() end,
+		__index = function(t, k)
+			if staticf[k] then
+				if staticf[k].ismethod then
+					return function(...)
+
+					end
+				end
+			end
+		end,
+		__call = function(t, ...)
+
+		end
+	})
+end
+
+function mergeBases(a, b)
+	local t = {
+		string = a.string or b.string,
+		number = a.number or b.number,
+		table = a.table or b.table,
+		class = a.class or b.class,
+		void = a.void or b.void,
+		bool = a.bool or b.bool,
+		none = a.none or b.none,
+		method = a.method or b.method,
+
+		tables = {},
+
+		public = a.public or b.public,
+		final = a.final or b.final,
+		static = a.static or b.static,
+
+		varargs = a.varargs or b.varargs
+	}
+	if a.tables then
+		for x, y in pairs(a.tables) do
+			t.tables[#t.tables +1] = y
+		end
+	end
+	if b.tables then
+		for x, y in pairs(b.tables) do
+			t.tables[#t.tables +1] = y
+		end
+	end
+	return t
+end
+
+function checkType(value, t)
+	local vt = type(value)
+	if vt == "function" and t.method then
+		return true
+	elseif vt == "number" and t.number then
+		return true
+	elseif vt == "string" and t.string then
+		return true
+	elseif vt == "nil" and t.none then
+		return true
+	elseif vt == "boolean" and t.bool then
+		return true
+	elseif vt == "table" and t.table then
+		local regs = {}
+		if not t.regs then
+			for a, b in pairs(t.tables) do
+				if b.keys.string then
+					if not regs.string then
+						regs.string = b.vals
+					else
+						regs.string = mergeBases(regs.string, b.vals)
+					end
+				elseif b.keys.method then
+					if not regs["function"] then
+						regs["function"] = b.vals
+					else
+						regs["function"] = mergeBases(regs["function"], b.vals)
+					end
+				elseif b.keys.number then
+					if not regs.number then
+						regs.number = b.vals
+					else
+						regs.number = mergeBases(regs.number, b.vals)
+					end
+				elseif b.keys.none then
+					if not regs["nil"] then
+						regs["nil"] = b.vals
+					else
+						regs["nil"] = mergeBases(regs["nil"], b.vals)
+					end
+				elseif b.keys.bool then
+					if not regs.boolean then
+						regs.boolean = b.vals
+					else
+						regs.boolean = mergeBases(regs.boolean, b.vals)
+					end
+				elseif b.keys.table then
+					if not regs.table then
+						regs.table = {tables = b.keys.tables, vals = b.vals}
+					else
+						for a, b in pairs(b.keys.tables) do
+							regs.table.tables[#regs.table.tables +1] = b
+						end
+						regs.table.vals = mergeBases(regs.table.vals, b.vals)
+					end
+				end
+			end
+			t.regs = regs
+		else
+			regs = t.regs
+		end
+		for a, b in pairs(value) do
+			local tb = type(b)
+			if tb == "table" and regs.table then
+				if not checkType(b, {tables = regs.table.tables, table = true}) then
+					return false
+				end
+			elseif not regs[tb] then
+				return false
+			else
+				if not checkType(b, regs[tb]) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+	return false
+end
+function checkArgs(args, targs)
+	for a = 1, #targs do
+		if not checkType(args[a], targs[a]) then
+			return false
+		end
+	end
+	return true
+end
+function checkMethodArgs(args, classpath, methodname)
+	return checkArgs(args, cmap[classpath].methods[methodname].args)
+end
 
 -- these functions are not used in the "loading" sequence; everything's loaded together in the "loaded" sequence
+local cloadenv2 = {}
+local cspecs = {methods = {}, fields = {}, import = {}, invimport = {}}
+do
+	local propnames = {
+		string = true,
+		number = true,
+		table = true,
+		class = true,
+		void = true,
+		bool = true,
+		none = true,
+		method = true,
+		tables = true,
+		public = true,
+		final = true,
+		static = true,
+		varargs = true
+	}
+	local cloadenv = {}
+	local varenv = setmetatable({}, {__index = cloadenv})
+	local __allow = false
+
+	setmetatable(cloadenv2, {__index = varenv, __newindex = function(t, k, v)
+		if not cloadenv[k] then
+			varenv[k] = v
+			if cspecs.fields[k] then
+				cspecs.fields[k].value = v
+			end
+		end
+	end})
+
+	local function addDummy(name)
+		cloadenv[name] = setmetatable({name = name}, {
+			__index = function(t, k)
+				logp("__index ", name, ": ", k)
+				return function(...) print(name.."."..k.."() args: ", ...) end
+			end,
+			__sub = function(a, b)
+				logp("__sub ", name, " ", (a or {}).name or "nil", " ", (b or {}).name or "nil")
+				return a
+			end,
+			__call = function(t, ...)
+				logp("__call ", name)
+			end
+		})
+	end
+	local newMod
+
+	local __sub = function(a, b)
+		return newMod(((a or {}).name or "nil")..((b or {}).name or "nil"), mergeBases(a, b))
+	end
+	function getBase(m)
+		return {
+			string = m.string == true,
+			number = m.number == true,
+			table = m.table == true,
+			class = m.class == true,
+			void = m.void == true,
+			bool = m.void == true,
+			none = m.none == true,
+			method = m.method == true,
+
+			tables = m.tables or {},
+
+			public = m.public or 0,
+			final = m.final == true,
+			static = m.static == true,
+
+			varargs = m.varargs == true
+		}
+	end
+
+	function add(name, k)
+		cloadenv[name] = k
+	end
+	function newMod(name, base)
+		return setmetatable({}, {
+			__sub = __sub,
+			__index = function(t, k)
+				if k == "name" then
+					return name
+				elseif base[k] then
+					return base[k]
+				elseif propnames[k] then
+					return nil
+				else
+					return function(s, ...)
+						cspecs.methods = cspecs.methods or {}
+						cspecs.methods[k] = getBase(t)
+						local args = {}
+						for a, b in pairs({...}) do
+							if type(b) == "table" then
+								args[a] = b
+							end
+						end
+						cspecs.methods[k].args = args
+						cspecs.methods[k].ismethod = true
+					end
+				end
+			end,
+			__newindex = function(t, k, v) end,
+			__call = function(t, n)
+				cspecs.fields = cspecs.fields or {}
+				cspecs.fields[n] = getBase(t)
+			end,
+			metatable = "Protected"
+		})
+	end
+	local function addMod(name, base)
+		cloadenv[name] = newMod(name, base)
+	end
+	function newType(name)
+		return newMod(name, {[name] = true})
+	end
+	function addType(name)
+		cloadenv[name] = newType(name)
+	end
+
+	addType "string"
+	add("package", function(str)
+		ass(type(str) == "string", "argument #1: string expected", 2)
+		cspecs.package = str
+	end)
+	add("import", function(str)
+		ass(type(str) == "string", "argument #1: string expected", 2)
+		if not cspecs.import then cspecs.import = {} end
+		if not cspecs.invimport then cspecs.invimport = {} end
+		cspecs.import[#cspecs.import +1] = str
+		cspecs.invimport[str:match("^.-[^%.]*$")] = str
+	end)
+
+	addMod("public", {public = 3})
+	addMod("protected", {public = 2})
+	addMod("private", {public = 1})
+
+	addType "static"
+	addType "final"
+
+	addType "void"
+	addType "string"
+	addType "number"
+	addType "class"
+	addMod("var", {string = true, number = true, table = true, bool = true, none = true, method = true})
+	addType "varargs"
+
+	-- doesn't look that nice, ik
+	add("table", setmetatable({}, {
+		__sub = __sub,
+		__index = function(t, k)
+			if k == "name" then
+				return "table"
+			elseif k == "table" then
+				return true
+			elseif k == "tables" then
+				return {keys = cloadenv.var, vals = cloadenv.var}
+			elseif type(k) == "table" then
+				return setmetatable({}, {
+					__sub = __sub,
+					__index = function(t, k2)
+						if k2 == "name" then
+							return "table"
+						elseif k2 == "table" then
+							return true
+						elseif k2 == "tables" then
+							return {keys = k, vals = cloadenv.var}
+						elseif type(k2) == "table" then
+							return setmetatable({}, {
+								__sub = __sub,
+								__index = function(t, k3)
+									if k3 == "name" then
+										return "table"
+									elseif k3 == "table" then
+										return true
+									elseif k3 == "tables" then
+										return {keys = k, vals = k2}
+									elseif propnames[k3] then
+										return
+									elseif type(k3) == "string" then
+										return function(s, ...)
+											cspecs.methods = cspecs.methods or {}
+											cspecs.methods[k3] = getBase(t)
+											local args = {}
+											for a, b in pairs({...}) do
+												if type(b) == "table" then
+													args[a] = b
+												end
+											end
+											cspecs.methods[k3].ismethod = true
+											cspecs.methods[k3].args = args
+										end
+									end
+								end,
+								__call = function(t, n) cspecs.fields = cspecs.fields or {} cspecs.fields[n] = getBase(t) end,
+								__newindex = function() end,
+								metatable = "protected"
+							})
+						elseif propnames[k2] then
+							return
+						elseif type(k2) == "string" then
+							return function(s, ...)
+								cspecs.methods = cspecs.methods or {}
+								cspecs.methods[k2] = getBase(t)
+								local args = {}
+								for a, b in pairs({...}) do
+									if type(b) == "table" then
+										args[a] = b
+									end
+								end
+								cspecs.methods[k2].ismethod = true
+								cspecs.methods[k2].args = args
+							end
+						end
+					end,
+					__call = function(t, n) cspecs.fields = cspecs.fields or {} cspecs.fields[n] = getBase(t) end,
+					__newindex = function() end,
+					metatable = "protected"
+				})
+			elseif propnames[k] then
+				return
+			elseif type(k) == "string" then
+				return function(s, ...)
+					cspecs.methods = cspecs.methods or {}
+					cspecs.methods[k] = getBase(t)
+					local args = {}
+					for a, b in pairs({...}) do
+						if type(b) == "table" then
+							args[a] = b
+						end
+					end
+					cspecs.methods[k].ismethod = true
+					cspecs.methods[k].args = args
+				end
+			end
+		end,
+		__call = function(t, n) cspecs.fields = cspecs.fields or {} cspecs.fields[n] = getBase(t) end,
+		__newindex = function() end,
+		metatable = "protected"
+	}))
+end
+function loadClassSpecs(f, path)
+	setfenv(f, cloadenv2)
+	local ok, err = pcall(f)
+	ass(ok, "Error executing class \""..path.."\": "..(err or "nil"), 2)
+	local s2 = cspecs
+	cspecs = {methods = {}, fields = {}, import = {}, invimport = {}}
+	return s2
+end
 function loadClassInternal(path)
-	print("loadClassInternal: ", path)
+	logp("loadClassInternal: ", path)
+	local c = readFile(path)
+	local ok, err = loadstring(c, fs.getName(path))
+	local class = loadClassSpecs(ass(ok, "Error loading class \""..path.."\": "..(err or "nil"), 2), path)
+	local classpath = class.package .. "." .. fs.getName(path):match("^([^%.]*).*$") -- match everything before an optional point
+	cmap[classpath] = class
+
+	local function ser(t, ind)
+		for a, b in pairs(t) do
+			if type(b) == "table" then
+				logp((" "):rep(ind)..tostring(a).." = "..tostring(b.name or b))
+				ser(b, ind+4)
+			else
+				logp((" "):rep(ind)..tostring(a).." = "..tostring(b))
+			end
+		end
+	end
+	ser(class, 0)
 end
 function loadAssetInternal(path)
 	err("Operation not supported: loadAssetInternal", 2)
@@ -54,10 +567,13 @@ end
 function loadDirectoryInternal(path)
 	ass(fs.exists(path) and fs.isDir(path), "directory argument is not an existing directory: "..path, 2)
 	for _, n in pairs(fs.list(path)) do
-		if not fs.isDir(n) then
-			loadClassInternal(n)
-		else
-			loadDirectoryInternal(n)
+		n = fs.combine(path, n)
+		if not preloads.assets[n] and not preloads.archives[n] then
+			if isFile(n) then
+				loadClassInternal(n)
+			else
+				loadDirectoryInternal(n)
+			end
 		end
 	end
 end
@@ -67,7 +583,7 @@ end
 function loadMetainfInternal(path)
 	ass(isFile(path), "metainf argument is not an existing file: "..path, 2)
 	local metainf = textutils.unserialize(readFile(path))
-	if type(metainf.MAIN) == "string" then
+	if type(metainf) == "table" and type(metainf.MAIN) == "string" then
 		meta.MAIN = metainf.MAIN
 	end
 end
@@ -85,7 +601,9 @@ function loadInternal()
 	for path, _ in pairs(preloads.assets) do
 		loadAssetInternal(path)
 	end
-	loadMetainfInternal(path)
+	if preloads.metainf then
+		loadMetainfInternal(preloads.metainf)
+	end
 end
 
 function exportInternal()
@@ -93,7 +611,8 @@ function exportInternal()
 end
 
 function runInternal()
-	err("Operation not supported: runInternal", 2)
+	--err("Operation not supported: runInternal", 2)
+
 end
 
 
@@ -146,13 +665,13 @@ end
 function load()
 	assert(state == 1, "state ~= loading", 2)
 	state = 2
-	
+
 	loadInternal()
 end
 
 function export(path)
 	assert(state == 2, "state ~= loaded", 2)
-	
+
 	exportInternal(path) -- no relative path here
 end
 
@@ -160,6 +679,6 @@ end
 function run()
 	assert(state == 2, "state ~= loaded", 2)
 	state = 3
-	
+
 	runInternal()
 end
