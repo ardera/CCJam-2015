@@ -1,0 +1,38 @@
+package "ardera.io.filesystem";
+
+(private - final - table) "handle";
+(private - bool) "isOpen";
+
+public : FileWriter(string);
+function FileWriter(path)
+	handle = _G.fs.open(path, "w")
+	isOpen = true
+end
+
+(public - void) : write(string);
+function write(str)
+	if isOpen then
+		handle.write(str)
+	else
+		_G.error("Stream closed", 2)
+	end
+end
+
+(public - void) : writeLine(string);
+function writeLine(str)
+	if isOpen then
+		handle.writeLine(str)
+	else
+		_G.error("Stream closed", 2)
+	end
+end
+
+(public - void) : close();
+function close(str)
+	if isOpen then
+		handle.close()
+		isOpen = false
+	else
+		_G.error("Stream closed", 2)
+	end
+end

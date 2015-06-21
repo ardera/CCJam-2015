@@ -37,12 +37,32 @@ local state = 0 -- 0=none; 1=loading; 2=loaded; 3=running; 4=stopped
 local meta = {
 	MAIN = "one.Main" -- one = objective native environment
 }
+local instances = {}
+local ObjectClass = "one.Object"
 
 -- private functions / internals
 local loadClassInternal, loadAssetInternal, loadDirectoryInternal, loadArchiveInternal,
 	loadInternal, exportInternal, runInternal, err, ass, isFile, isDir, readFile, loadClassSpecs,
-	invokeMethod, buildMethodEnv, checkType, checkArgs, getClassAccessor, getStaticClassAccessor,
-	setMethodEnv, invokeMethodEnv
+	invokeMethod, buildMethodEnv, checkType, checkArgs, getClassAccessor,
+	setMethodEnv, invokeMethodEnv, buildStaticMethodEnv, buildConstructorEnv, getMethodEnv, 
+	getInstanceTable, setInstanceTable, setInstanceValue, getInstanceValue, newInstanceID,
+	classTreeHook, resetClassTreeHook, getStaticValue, setStaticValue, getFields, getMethods,
+	getConstructorEnv, getStaticSuper, getInstanceSuper, getSuperMethods, getSuperFields,
+	getConstructorName, invokeConstructor, getConstructorBody, getMethodBody, getConstructor,
+	checkAccess, instanceOf, pushStack, popStack, getCaller, getCallerClasspath, getCallerFieldname,
+	loadNatives, hasConstructor, checkAccessRaw, checkConstructorAccess, addStaticInit, staticInit,
+	buildStaticConstructorEnv
+
+local function ser(t, ind)
+	for a, b in pairs(t) do
+		if type(b) == "table" then
+			logp((" "):rep(ind or 0)..tostring(a).." = "..tostring(b.name or b))
+			ser(b, (ind or 0)+4)
+		else
+			logp((" "):rep(ind or 0)..tostring(a).." = "..tostring(b))
+		end
+	end
+end
 
 function err(msg, level)
 	state = 4
@@ -79,40 +99,142 @@ function setMethodEnv(classpath, fieldname, env)
 	if not temp_setMethodEnv[classpath] then
 		temp_setMethodEnv[classpath] = {}
 	end
-	if temp_setMethodEnv[classpath] == env then
+	if temp_setMethodEnv[classpath][fieldname] == env then
 		return
 	end
-
-	setfenv(cmap[classpath].methods[fieldname].value, buildMethodEnv(classpath))
+	setfenv(getMethodBody(classpath, fieldname), env)
 	temp_setMethodEnv[classpath][fieldname] = env
 end
 
-function invokeMethod(classpath, fieldname, arguments)
-
-end
-function invokeMethodEnv(classpath, fieldname, arguments)
-	setMethodEnv(classpath, fieldname, buildMethodEnv(classpath))
-	return invokeMethod(classpath, fieldname, arguments)
-end
-
-local temp_buildMethodEnv = {}
-function buildMethodEnv(classpath)
-	if temp_buildMethodEnv[classpath] then
-		return temp_buildMethodEnv[classpath]
+local temp_setConstructorEnv = {}
+function setConstructorEnv(classpath, env)
+	if temp_setConstructorEnv[classpath] == env then
+		return
 	end
-	local c = cmap[classpath]
+	setfenv(getConstructorBody(classpath), env)
+	temp_setConstructorEnv[classpath]= env
+end
+
+local threadid = 3
+local callsperthread = 250
+local stackpercall = 4
+local stackperroutinecall = 2
+local calls = 20 -- call offset
+function invokeMethod(f, arguments)
+	if (calls+stackpercall) >= callsperthread then
+		threadid = threadid +1
+		local bcalls = calls
+		calls = stackperroutinecall
+		local rets = {}
+		local routine = coroutine.create(function() ret = f(unpack(arguments)) end)
+		local w = coroutine.wrap(routine)
+		local e = {}
+		while coroutine.status(routine) ~= "dead" do
+			local filter = w(unpack(e))
+			e = {os.pullEvent(filter)}
+		end
+		calls = bcalls
+		threadid = threadid -1
+		return ret
+	else
+		calls = calls + stackpercall
+		local ret = f(unpack(arguments))
+		calls = calls - stackpercall
+		return ret
+	end
+end
+function invokeMethodEnv(classpath, fieldname, iid, arguments)
+	setMethodEnv(classpath, fieldname, getMethodEnv(classpath, iid))
+	pushStack(classpath, fieldname)
+	local ret = invokeMethod(getMethodBody(classpath, fieldname), arguments)
+	popStack()
+	return ret
+end
+function invokeMethodStatic(classpath, fieldname, arguments)
+	setMethodEnv(classpath, fieldname, buildStaticMethodEnv(classpath))
+	pushStack(classpath, fieldname)
+	local ret = invokeMethod(getMethodBody(classpath, fieldname), arguments)
+	popStack()
+	return ret
+end
+function invokeConstructor(classpath, iid, arguments)
+	setConstructorEnv(classpath, getConstructorEnv(classpath, iid))
+	pushStack(classpath, "<init>")
+	invokeMethod(getConstructorBody(classpath), arguments)
+	popStack()
+end
+
+local temp_getConstructor = {}
+function getConstructor(classpath)
+	if temp_getConstructor[classpath] then
+		return temp_getConstructor[classpath]
+	end
+	
+	local c = nil
+	local function delegateConstructor(p)
+		if not cmap[p] then return end
+		c = c or cmap[p].constructor
+		if cmap[p].parent then
+			delegateConstructor(cmap[p].parent)
+		end
+	end
+	delegateConstructor(classpath)
+	
+	temp_getConstructor[classpath] = c
+	return c
+end
+
+function hasConstructor(classpath)
+	return getConstructor(classpath) ~= nil
+end
+
+local temp_getConstructorBody = {}
+function getConstructorBody(classpath)
+	if temp_getConstructorBody[classpath] then
+		return temp_getConstructorBody[classpath]
+	end
+	
+	local c = (getConstructor(classpath) or {}).value
+	temp_getConstructorBody[classpath] = (getConstructor(classpath) or {}).value
+	return c
+end
+
+function getMethodBody(classpath, fieldname)
+	return getMethods(classpath)[fieldname].value
+end
+function getInstanceTable(iid)
+	return instances[iid]
+end
+function setInstanceTable(iid, t)
+	instances[iid] = t
+end
+function setInstanceValue(iid, fieldname, v)
+	instances[iid][fieldname] = v
+end
+function getInstanceValue(iid, fieldname)
+	return instances[iid][fieldname]
+end
+function newInstanceID()
+	local id = #instances +1
+	instances[id] = {}
+	return id
+end
+
+do
 	local path = ""
 	local tab = ctree
-	local function classTreeHook(k)
+	function classTreeHook(k)
 		if path ~= "" then
 			path = "."
 		end
 		path = path .. k
 		return setmetatable({}, {
-			__newindex = function() end,
+			__newindex = function(t, k, v)
+				err("Attempt to set class "..path.."."..k, 2)
+			end,
 			__index = function(t, k)
 				if tab[k] and tab[k].methods then
-					local acc = getStaticClassAccessor(path)
+					local acc = getClassAccessor(path)
 					path = ""
 					tab = ctree
 					return acc
@@ -122,55 +244,460 @@ function buildMethodEnv(classpath)
 			end
 		})
 	end
+	function resetClassTreeHook()
+		path = ""
+		tab = ctree
+	end
+end
 
+local temp_getInstanceSuper = {}
+function getInstanceSuper(classpath, iid, canconstruct)
+	return setmetatable({}, {
+		__index = function(t, k)
+			
+		end,
+		__newindex = function(t, k, v)
+			err("Attempt to set super field "..k, 2)
+		end,
+		__call = function(t, ...)
+			ass(canconstruct, "super constructor calls only possible in constructor", 2)
+			local c = getConstructorEnv(classpath, iid)
+		end,
+		metatable = "protected"
+	})
+end
+
+local temp_getStaticSuper = {}
+function getStaticSuper(classpath)
+	
+end
+
+local stack = {{p="one.Native", f="run"}}
+function pushStack(classpath, fieldname)
+	stack[#stack +1] = {p=classpath, f=fieldname}
+end
+
+function popStack()
+	stack[#stack] = nil
+end
+
+function getCaller()
+	return stack[#stack].p, stack[#stack].f
+end
+function getCallerClasspath()
+	return stack[#stack].p
+end
+function getCallerFieldname()
+	return stack[#stack].f
+end
+
+local temp_constructorEnvs = {}
+function buildConstructorEnv(classpath, iid2, super)
+	local c = cmap[classpath]
+	
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
+	local iid = iid2 or newInstanceID()
+	
 	local env = setmetatable({}, {
 		__index = function(t, k)
 			if c.invimport[k] then
-				return getStaticClassAccessor(c.invimport[k])
+				return getClassAccessor(c.invimport[k])
 			elseif ctree[k] then
-				path = ""
-				tab = ctree
+				resetClassTreeHook()
 				return classTreeHook(k)
+			elseif fields[k] then
+				if fields[k].static then
+					return fields[k].value
+				else
+					return getInstanceValue(iid, k)
+				end
+			elseif methods[k] then
+				return function(...)
+					local args = {...}
+					ass(checkArguments(args, methods[k].args), "Attempt to call method with wrong arguments: "..classpath.."."..k, 2)
+					if methods[k].static then
+						return invokeMethodStatic(classpath, k, args)
+					else
+						return invokeMethodEnv(classpath, k, iid, args)
+					end
+				end
+			elseif k == "_G" then
+				return _G
+			elseif k == "super" then
+				return super or getInstanceSuper(classpath, iid, true)
+			else
+				return getInstanceValue(iid, k)
 			end
 		end,
 		__newindex = function(t, k, v)
-		end
+			if fields[k] then
+				if fields[k].static then
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					ass((fields[k].final and not fields[k].value) or not fields[k].final, "Attempt to set initialized final field "..classpath.."."..k, 2)
+					fields[k].value = v
+				else
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					ass((fields[k].final and not getInstanceValue(iid, k)) or not fields[k].final, "Attempt to set initialized final field "..classpath.."."..k, 2)
+					setInstanceValue(iid, k, v)
+				end
+			elseif methods[k] then
+				err("Attempt to set method "..classpath.."."..k, 2)
+			elseif ctree[k] then
+				err("Attempt to set class "..k, 2)
+			elseif c.invimport[k] then
+				err("Attempt to set imported class "..k, 2)
+			elseif k == "_G" then
+				err("Attempt to set global", 2)
+			elseif k == "super" then
+				err("Attempt to set super", 2)
+			else
+				setInstanceValue(iid, k, v)
+			end
+		end,
+		metatable = "protected",
 	})
+	temp_constructorEnvs[iid] = env
+	return env
+end
+function getConstructorEnv(classpath, iid)
+	return temp_constructorEnvs[iid] or buildConstructorEnv(classpath, iid)
+end
+
+local temp_buildStaticConstructorEnv = {}
+function buildStaticConstructorEnv(classpath)
+	if temp_buildStaticConstructorEnv[classpath] then
+		return temp_buildStaticConstructorEnv[classpath]
+	end
+	
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
+	local c = cmap[classpath]
+	local env = setmetatable({}, {
+		__index = function(t, k)
+			if c.invimport[k] then
+				return getClassAccessor(c.invimport[k])
+			elseif ctree[k] then
+				resetClassTreeHook()
+				return classTreeHook(k)
+			elseif fields[k] then
+				if fields[k].static then
+					return fields[k].value
+				else
+					err("Attempt to index instance field "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				if methods[k].static then
+					return function(...)
+						local args = {...}
+						ass(checkArgs(args, methods[k].args), "Attempt to call method with wrong arguments: "..classpath.."."..k, 2)
+						return invokeMethodStatic(classpath, k, args)
+					end
+				else
+					err("Attempt to index instance method "..classpath.."."..k, 2)
+				end
+			elseif k == "_G" then
+				return _G
+			elseif k == "super" then
+				return super or getStaticSuper(classpath)
+			else
+				return getStaticValue(classpath, k)
+			end
+		end,
+		__newindex = function(t, k, v)
+			if fields[k] then
+				ass((fields[k].final and not fields[k].value) or not fields[k].final, "Attempt to set initialized final field "..classpath.."."..k, 2)
+				if fields[k].static then
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					fields[k].value = v
+				else
+					err("Attempt to set instance field "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				err("Attempt to set method "..classpath.."."..k, 2)
+			elseif ctree[k] then
+				err("Attempt to set class "..k, 2)
+			elseif c.invimport[k] then
+				err("Attempt to set imported class "..k, 2)
+			elseif k == "_G" then
+				err("Attempt to set global", 2)
+			elseif k == "super" then
+				err("Attempt to set super", 2)
+			else
+				setStaticValue(classpath, k, v)
+			end
+		end,
+		metatable = "protected"
+	})
+	
+	return env
+end
+
+local temp_methodEnvs = {}
+function buildMethodEnv(classpath, iid2, super)
+	local c = cmap[classpath]
+	
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
+	local iid = iid2 or newInstanceID()
+	
+	local env = setmetatable({}, {
+		__index = function(t, k)
+			if c.invimport[k] then
+				return getClassAccessor(c.invimport[k])
+			elseif ctree[k] then
+				resetClassTreeHook()
+				return classTreeHook(k)
+			elseif fields[k] then
+				if fields[k].static then
+					return fields[k].value
+				else
+					return getInstanceValue(iid, k)
+				end
+			elseif methods[k] then
+				return function(...)
+					local args = {...}
+					ass(checkArguments(args, methods[k].args), "Attempt to call method with wrong arguments: "..classpath.."."..k, 2)
+					if methods[k].static then
+						return invokeMethodStatic(classpath, k, args)
+					else
+						return invokeMethodEnv(classpath, k, iid, args)
+					end
+				end
+			elseif k == "_G" then
+				return _G
+			elseif k == "super" then
+				return super or getInstanceSuper(classpath, iid2, false)
+			else
+				return getInstanceValue(iid, k)
+			end
+		end,
+		__newindex = function(t, k, v)
+			if fields[k] then
+				ass(not fields[k].final, "Attempt to set final field "..classpath.."."..k, 2)
+				if fields[k].static then
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					fields[k].value = v
+				else
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					setInstanceValue(iid, k, v)
+				end
+			elseif methods[k] then
+				err("Attempt to set method "..classpath.."."..k, 2)
+			elseif ctree[k] then
+				err("Attempt to set class "..k, 2)
+			elseif c.invimport[k] then
+				err("Attempt to set imported class "..k, 2)
+			elseif k == "_G" then
+				err("Attempt to set global", 2)
+			elseif k == "super" then
+				err("Attempt to set super", 2)
+			else
+				setInstanceValue(iid, k, v)
+			end
+		end,
+		metatable = "protected",
+	})
+	temp_methodEnvs[iid] = env
+	return env
+end
+function getMethodEnv(classpath, iid)
+	return temp_methodEnvs[id] or buildMethodEnv(classpath, iid)
+end
+
+local temp_buildStaticMethodEnv = {}
+function buildStaticMethodEnv(classpath)
+	if temp_buildStaticMethodEnv[classpath] then
+		return temp_buildStaticMethodEnv[classpath]
+	end
+	
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
+	local c = cmap[classpath]
+	local env = setmetatable({}, {
+		__index = function(t, k)
+			if c.invimport[k] then
+				return getClassAccessor(c.invimport[k])
+			elseif ctree[k] then
+				resetClassTreeHook()
+				return classTreeHook(k)
+			elseif fields[k] then
+				if fields[k].static then
+					return fields[k].value
+				else
+					err("Attempt to index instance field "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				if methods[k].static then
+					return function(...)
+						local args = {...}
+						ass(checkArgs(args, methods[k].args), "Attempt to call method with wrong arguments: "..classpath.."."..k, 2)
+						return invokeMethodStatic(classpath, k, args)
+					end
+				else
+					err("Attempt to index instance method "..classpath.."."..k, 2)
+				end
+			elseif k == "_G" then
+				return _G
+			elseif k == "super" then
+				return super or getStaticSuper(classpath)
+			else
+				return getStaticValue(classpath, k)
+			end
+		end,
+		__newindex = function(t, k, v)
+			if fields[k] then
+				ass(not fields[k].final, "Attempt to set final field "..classpath.."."..k, 2)
+				if fields[k].static then
+					ass(checkType(v, fields[k]), "Attempt to set wrong type: "..type(v).." on field "..classpath.."."..k, 2)
+					fields[k].value = v
+				else
+					err("Attempt to set instance field "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				err("Attempt to set method "..classpath.."."..k, 2)
+			elseif ctree[k] then
+				err("Attempt to set class "..k, 2)
+			elseif c.invimport[k] then
+				err("Attempt to set imported class "..k, 2)
+			elseif k == "_G" then
+				err("Attempt to set global", 2)
+			elseif k == "super" then
+				err("Attempt to set super", 2)
+			else
+				setStaticValue(classpath, k, v)
+			end
+		end,
+		metatable = "protected"
+	})
+	
+	return env
+end
+
+
+local temp_staticValues = {}
+function getStaticValue(classpath, k)
+	if not temp_staticValues[classpath] then
+		return nil
+	end
+	return temp_staticValues[classpath][k]
+end
+function setStaticValue(classpath, k, v)
+	if not temp_staticValues[classpath] then
+		temp_staticValues[classpath] = {}
+	end
+	temp_staticValues[classpath][k] = v
 end
 
 local temp_getClassAccessor = {}
 function getClassAccessor(classpath, classpath2)
 
 end
-local temp_getStaticFields = {}
-function getStaticFields(classpath) -- includes methods
 
-end
-
-local temp_getStaticClassAccessor = {}
-function getStaticClassAccessor(classpath)
-	if temp_getStaticClassAccessor[classpath] then
-		return temp_getStaticClassAccessor[classpath]
+function newInstance(classpath, args)
+	local iid = newInstanceID()
+	local menv = buildMethodEnv(classpath, iid)
+	local cenv = buildConstructorEnv(classpath, iid)
+	
+	if hasConstructor(classpath) then
+		ass(checkConstructorAccess(getCallerClasspath(), classpath), getCallerClasspath().." can not access "..classpath..".<init>", 2)
+		invokeConstructor(classpath, iid, args)
 	end
-	local staticf = getStaticFields(classpath)
+	
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
 	return setmetatable({}, {
-		__newindex = function() end,
 		__index = function(t, k)
-			if staticf[k] then
-				if staticf[k].ismethod then
-					return function(...)
-
+			if fields[k] then
+				ass(checkAccess(getCallerClasspath(), classpath, k), getCallerClasspath().." can't access field "..classpath.."."..k, 2)
+				if fields[k].static then
+					return fields[k].value
+				else
+					return getInstanceValue(iid, k)
+				end
+			elseif methods[k] then
+				ass(checkAccess(getCallerClasspath(), classpath, k), getCallerClasspath().." can't access method "..classpath.."."..k, 2)
+				return function(...)
+					local args2 = {...}
+					ass(checkArgs(args2, methods[k].args), "Attempt to call method with wrong arguments: "..classpath.."."..k, 2)
+					if methods[k].static then
+						return invokeMethodStatic(classpath, k, args2)
+					else
+						return invokeMethodEnv(classpath, k, iid, args2)
 					end
 				end
 			end
 		end,
-		__call = function(t, ...)
-
-		end
+		__newindex = function(t, k, v)
+		
+		end,
+		metatable = "protected"
 	})
 end
 
+local temp_getClassAccessor = {}
+function getClassAccessor(classpath)
+	if temp_getClassAccessor[classpath] then
+		return temp_getClassAccessor[classpath]
+	end
+	local c = cmap[classpath]
+	local c2 = cmap[classpath2]
+	local fields = getFields(classpath)
+	local methods = getMethods(classpath)
+	
+	local t = setmetatable({}, {
+		__index = function(t, k)
+			ass(type(k)=="string", "invalid index type: "..type(k), 2)
+			local ccp = getCallerClasspath()
+			if fields[k] then
+				if fields[k].static then
+					ass(checkAccess(ccp, classpath, k), ccp.." can not access "..classpath.."."..k, 2)
+					return fields[k].value
+				else
+					err("Attempt to index instance variable "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				if methods[k].static then
+					ass(checkAccess(ccp, classpath, k), ccp.." can not access "..classpath.."."..k, 2)
+					return function(...)
+						return invokeMethodStatic(classpath, k, {...})
+					end
+				else
+					err("Attempt to index instance method "..classpath.."."..k, 2)
+				end
+			end
+		end,
+		__newindex = function(t, k, v)
+			ass(type(k)=="string", "invalid index type: "..type(k), 2)
+			local ccp = getCallerClasspath()
+			if fields[k] then
+				if fields[k].static then
+					ass(checkType(v, fields[k]), "Attempt to set wrong type "..type(v).." on field "..classpath.."."..k, 2)
+					ass(checkAccess(ccp, classpath, k), ccp.." can not access "..classpath.."."..k, 2)
+					fields[k].value = v
+				else
+					err("Attempt to set instance field "..classpath.."."..k, 2)
+				end
+			elseif methods[k] then
+				err("Attempt to set method field "..classpath.."."..k, 2)
+			end
+		end,
+		__call = function(t, ...)
+			return newInstance(classpath, {...})
+		end
+	})
+	temp_getClassAccessor[classpath] = t
+	return t
+end
+
 function mergeBases(a, b)
+	a = a or {}
+	b = b or {}
 	local t = {
 		string = a.string or b.string,
 		number = a.number or b.number,
@@ -180,7 +707,8 @@ function mergeBases(a, b)
 		bool = a.bool or b.bool,
 		none = a.none or b.none,
 		method = a.method or b.method,
-
+		var = a.var or b.var,
+		
 		tables = {},
 
 		public = a.public or b.public,
@@ -189,12 +717,12 @@ function mergeBases(a, b)
 
 		varargs = a.varargs or b.varargs
 	}
-	if a.tables then
+	if #(a.tables or {}) > 0 then
 		for x, y in pairs(a.tables) do
 			t.tables[#t.tables +1] = y
 		end
 	end
-	if b.tables then
+	if #(b.tables or {}) > 0 then
 		for x, y in pairs(b.tables) do
 			t.tables[#t.tables +1] = y
 		end
@@ -202,8 +730,33 @@ function mergeBases(a, b)
 	return t
 end
 
+local temp_instanceOf = {}
+function instanceOf(classpath1, classpath2)
+	if temp_instanceOf[classpath1] and temp_instanceOf[classpath1][classpath2] then
+		return temp_instanceOf[classpath1][classpath2]
+	end
+	if not temp_instanceOf[classpath1] then
+		temp_instanceOf[classpath1] = {}
+	end
+	
+	local function delegate(p)
+		if p == classpath2 then
+			return true
+		elseif not p then
+			return false
+		else
+			return delegate(cmap[p].parent)
+		end
+	end
+	local r = delegate(classpath1)
+	
+	temp_instanceOf[classpath1] = r
+	return r
+end
+
 function checkType(value, t)
 	local vt = type(value)
+	if t.var then return true end
 	if vt == "function" and t.method then
 		return true
 	elseif vt == "number" and t.number then
@@ -218,7 +771,42 @@ function checkType(value, t)
 		local regs = {}
 		if not t.regs then
 			for a, b in pairs(t.tables) do
-				if b.keys.string then
+				if b.keys.var and b.vals.var then return true end
+				if b.keys.var then
+					if not regs.string then
+						regs.string = b.vals
+					else
+						regs.string = mergeBases(regs.string, b.vals)
+					end
+					if not regs["function"] then
+						regs["function"] = b.vals
+					else
+						regs["function"] = mergeBases(regs["function"], b.vals)
+					end
+					if not regs.number then
+						regs.number = b.vals
+					else
+						regs.number = mergeBases(regs.number, b.vals)
+					end
+					if not regs["nil"] then
+						regs["nil"] = b.vals
+					else
+						regs["nil"] = mergeBases(regs["nil"], b.vals)
+					end
+					if not regs.boolean then
+						regs.boolean = b.vals
+					else
+						regs.boolean = mergeBases(regs.boolean, b.vals)
+					end
+					if not regs.table then
+						regs.table = {tables = b.keys.tables, vals = b.vals}
+					else
+						for a, b in pairs(b.keys.tables) do
+							regs.table.tables[#regs.table.tables +1] = b
+						end
+						regs.table.vals = mergeBases(regs.table.vals, b.vals)
+					end
+				elseif b.keys.string then
 					if not regs.string then
 						regs.string = b.vals
 					else
@@ -290,13 +878,172 @@ function checkArgs(args, targs)
 	return true
 end
 function checkMethodArgs(args, classpath, methodname)
-	return checkArgs(args, cmap[classpath].methods[methodname].args)
+	return checkArgs(args, getMethods(classpath)[methodname])
+end
+function checkAccessRaw(classpath1, classpath2, pub)
+	if pub == 3 then		-- public
+		return true
+	elseif pub == 2 then 	-- protected
+		-- available to package
+		if c1.package == c2.package then
+			return true
+		else
+			return false
+		end
+	elseif pub == 1 then	-- private
+		-- available to child classes
+		if instanceOf(classpath1, classpath2) then
+			return true
+		else
+			return false
+		end
+	elseif pub == 0 then	-- locked
+		if classpath1 == classpath2 then
+			return true
+		end
+		return false
+	end
+	return false
+end
+function checkAccess(classpath1, classpath2, fieldname)
+	if classpath1 == classpath2 then
+		return true
+	end
+	local c1 = cmap[classpath1]
+	local c2 = cmap[classpath2]
+	local f = getFields(classpath2)[fieldname]
+	local m = getMethods(classpath2)[fieldname]
+	local pub = 0
+	if m then
+		pub = m.public
+	elseif f then
+		pub = f.public
+	end
+	return checkAccessRaw(classpath1, classpath2, pub)
+end
+function checkConstructorAccess(classpath1, classpath2)
+	return checkAccessRaw(classpath1, classpath2, getConstructor(classpath2).public)
 end
 
+local temp_getFields = {}
+local temp_getSuperFields = {}
+function getFields(classpath)
+	if temp_getFields[classpath] then
+		return temp_getFields[classpath]
+	end
+	
+	local fields = {}
+	local function delegateFields(classpath)
+		for a, b in pairs(cmap[classpath].fields) do
+			if not fields[a] then
+				fields[a] = b
+			end
+		end
+		if cmap[classpath].parent then
+			delegateFields(cmap[classpath].parent)
+		end
+	end
+	delegateFields(classpath)
+	
+	temp_getFields[classpath] = fields
+	return fields
+end
+function getSuperFields(classpath)
+	if temp_getSuperFields[classpath] then
+		return temp_getSuperFields[classpath]
+	end
+	
+	local fields = {}
+	local function delegateFields(p)
+		for a, b in pairs(cmap[p].fields) do
+			if not fields[a] then
+				fields[a] = b
+			end
+		end
+		if cmap[p].parent then
+			delegateFields(cmap[p].parent)
+		end
+	end
+	delegateFields(cmap[classpath].parent)
+	
+	for a, b in pairs(cmap[classpath].fields) do
+		if not fields[a] then
+			fields[a] = b
+		end
+	end
+	
+	temp_getSuperFields[classpath] = fields
+	return fields
+end
+
+local temp_getMethods = {}
+local temp_getSuperMethods = {}
+function getMethods(classpath)
+	if temp_getMethods[classpath] then
+		return temp_getMethods[classpath]
+	end
+	
+	local methods = {}
+	local function delegateMethods(classpath)
+		for a, b in pairs(cmap[classpath].methods) do
+			methods[a] = methods[a] or b
+		end
+		if cmap[classpath].parent then
+			delegateMethods(cmap[classpath].parent)
+		end
+	end
+	delegateMethods(classpath)
+	
+	temp_getMethods[classpath] = methods
+	return methods
+end
+function getSuperMethods(classpath)
+	if temp_getSuperMethods[classpath] then
+		return temp_getSuperMethods[classpath]
+	end
+	
+	local methods = {}
+	local function delegateMethods(p)
+		for a, b in pairs(cmap[p].methods) do
+			if not fields[a] then
+				fields[a] = b
+			end
+		end
+		if cmap[p].parent then
+			delegateMethods(cmap[p].parent)
+		end
+	end
+	delegateMethods(cmap[classpath].parent)
+	
+	for a, b in pairs(cmap[classpath].Methods) do
+		if not methods[a] then
+			methods[a] = b
+		end
+	end
+	
+	temp_getSuperMethods[classpath] = methods
+	return methods
+end
+
+local temp_staticInits = {}
+function addStaticInit(cp)
+	temp_staticInits[#temp_staticInits +1] = cp
+end
+function staticInit()
+	for a, b in pairs(temp_staticInits) do
+		setfenv(cmap[b].cinit, buildStaticConstructorEnv(b))
+		invokeMethod(cmap[b].cinit, {})
+	end
+end
+
+
+
 -- these functions are not used in the "loading" sequence; everything's loaded together in the "loaded" sequence
+local cname = ""
 local cloadenv2 = {}
 local cspecs = {methods = {}, fields = {}, import = {}, invimport = {}}
 do
+	local getClassModifier
 	local propnames = {
 		string = true,
 		number = true,
@@ -308,22 +1055,46 @@ do
 		method = true,
 		tables = true,
 		public = true,
+		private = true,
+		protected = true,
 		final = true,
 		static = true,
-		varargs = true
+		varargs = true,
+		var = true
 	}
-	local cloadenv = {}
+	local cloadenv = setmetatable({}, {__index = function(t, k)
+		if cspecs.invimport[k] then
+			return getClassModifier(cspecs.invimport[k])
+		end
+	end})
 	local varenv = setmetatable({}, {__index = cloadenv})
 	local __allow = false
 
-	setmetatable(cloadenv2, {__index = varenv, __newindex = function(t, k, v)
-		if not cloadenv[k] then
-			varenv[k] = v
-			if cspecs.fields[k] then
-				cspecs.fields[k].value = v
+	setmetatable(cloadenv2, {
+		__index = varenv, 
+		__newindex = function(t, k, v)
+			if not cloadenv[k] then
+				if cspecs.fields[k] then
+					cspecs.fields[k].value = v
+				elseif cspecs.methods[k] then
+					if k == cname then
+						cspecs.constructor = cspecs.methods[k]
+						cspecs.constructor.value = v
+						cspecs.methods[k] = nil
+					else
+						cspecs.methods[k].value = v
+					end
+				elseif cname == k then
+					cspecs.constructor = mergeBases(cloadenv.var)
+					cspecs.constructor.args = {}
+					cspecs.constructor.value = v
+				else
+					varenv[k] = v
+				end
 			end
-		end
-	end})
+		end,
+		metatable = "protected"
+	})
 
 	local function addDummy(name)
 		cloadenv[name] = setmetatable({name = name}, {
@@ -352,7 +1123,7 @@ do
 			table = m.table == true,
 			class = m.class == true,
 			void = m.void == true,
-			bool = m.void == true,
+			bool = m.bool == true,
 			none = m.none == true,
 			method = m.method == true,
 
@@ -399,7 +1170,7 @@ do
 				cspecs.fields = cspecs.fields or {}
 				cspecs.fields[n] = getBase(t)
 			end,
-			metatable = "Protected"
+			metatable = "protected"
 		})
 	end
 	local function addMod(name, base)
@@ -411,10 +1182,49 @@ do
 	function addType(name)
 		cloadenv[name] = newType(name)
 	end
-
+	
+	local temp_getClassModifier = {}
+	function getClassModifier(classpath)
+		if temp_getClassModifier[classpath] then
+			return temp_getClassModifier[classpath]
+		end
+		
+		return setmetatable({}, {
+			__sub = __sub,
+			__index = function(t, k)
+				if k == "name" then
+					return name
+				elseif base[k] then
+					return base[k]
+				elseif propnames[k] then
+					return nil
+				else
+					return function(s, ...)
+						cspecs.methods = cspecs.methods or {}
+						cspecs.methods[k] = getBase(t)
+						local args = {}
+						for a, b in pairs({...}) do
+							if type(b) == "table" then
+								args[a] = b
+							end
+						end
+						cspecs.methods[k].args = args
+						cspecs.methods[k].ismethod = true
+					end
+				end
+			end,
+			__newindex = function(t, k, v) end,
+			__call = function(t, n)
+				cspecs.fields = cspecs.fields or {}
+				cspecs.fields[n] = getBase(t)
+			end,
+		})
+	end
+		
 	addType "string"
 	add("package", function(str)
 		ass(type(str) == "string", "argument #1: string expected", 2)
+		ass(not cspecs.package, "package already set", 2)
 		cspecs.package = str
 	end)
 	add("import", function(str)
@@ -422,22 +1232,65 @@ do
 		if not cspecs.import then cspecs.import = {} end
 		if not cspecs.invimport then cspecs.invimport = {} end
 		cspecs.import[#cspecs.import +1] = str
-		cspecs.invimport[str:match("^.-[^%.]*$")] = str
+		local name = str:match("^.-([^%.]*)$")
+		cspecs.invimport[name] = str
 	end)
-
+	add("extend", function(str)
+		ass(type(str) == "string", "argument #1: string expected", 2)
+		ass(not cspecs.parent, "parent already set", 2)
+		cspecs.parent = str
+	end)
+	
+	
 	addMod("public", {public = 3})
 	addMod("protected", {public = 2})
 	addMod("private", {public = 1})
-
-	addType "static"
+	
+	add("static", setmetatable({}, {
+		__sub = __sub,
+		__index = function(t, k)
+			if k == "name" then
+				return name
+			elseif k == "static" then
+				return true
+			elseif propnames[k] then
+				return nil
+			else
+				return function(s, ...)
+					cspecs.methods = cspecs.methods or {}
+					cspecs.methods[k] = getBase({static = true})
+					local args = {}
+					for a, b in pairs({...}) do
+						if type(b) == "table" then
+							args[a] = b
+						end
+					end
+					cspecs.methods[k].args = args
+					cspecs.methods[k].ismethod = true
+				end
+			end
+		end,
+		__newindex = function(t, k, v) end,
+		__call = function(t, n)
+			if type(n) == "string" then
+				cspecs.fields = cspecs.fields or {}
+				cspecs.fields[n] = getBase(t)
+			else
+				cspecs.cinit = n
+			end
+		end,
+		metatable = "Protected"
+	}))
+	
 	addType "final"
 
 	addType "void"
 	addType "string"
 	addType "number"
 	addType "class"
-	addMod("var", {string = true, number = true, table = true, bool = true, none = true, method = true})
+	addMod("var", {string = true, number = true, table = true, bool = true, none = true, method = true, var = true})
 	addType "varargs"
+	addType "bool"
 
 	-- doesn't look that nice, ik
 	add("table", setmetatable({}, {
@@ -448,7 +1301,7 @@ do
 			elseif k == "table" then
 				return true
 			elseif k == "tables" then
-				return {keys = cloadenv.var, vals = cloadenv.var}
+				return {{keys = cloadenv.var, vals = cloadenv.var}}
 			elseif type(k) == "table" then
 				return setmetatable({}, {
 					__sub = __sub,
@@ -458,7 +1311,7 @@ do
 						elseif k2 == "table" then
 							return true
 						elseif k2 == "tables" then
-							return {keys = k, vals = cloadenv.var}
+							return {{keys = k, vals = cloadenv.var}}
 						elseif type(k2) == "table" then
 							return setmetatable({}, {
 								__sub = __sub,
@@ -468,7 +1321,7 @@ do
 									elseif k3 == "table" then
 										return true
 									elseif k3 == "tables" then
-										return {keys = k, vals = k2}
+										return {{keys = k, vals = k2}}
 									elseif propnames[k3] then
 										return
 									elseif type(k3) == "string" then
@@ -493,6 +1346,7 @@ do
 						elseif propnames[k2] then
 							return
 						elseif type(k2) == "string" then
+							
 							return function(s, ...)
 								cspecs.methods = cspecs.methods or {}
 								cspecs.methods[k2] = getBase(t)
@@ -533,33 +1387,36 @@ do
 		metatable = "protected"
 	}))
 end
-function loadClassSpecs(f, path)
+
+function loadClassSpecs(f, path, name)
+	cname = name
 	setfenv(f, cloadenv2)
 	local ok, err = pcall(f)
+	cname = ""
 	ass(ok, "Error executing class \""..path.."\": "..(err or "nil"), 2)
+	ass(cspecs.package, "Error executing class \""..path.."\": Package not set", 2)
+	cspecs.parent = cspecs.parent or ObjectClass
 	local s2 = cspecs
 	cspecs = {methods = {}, fields = {}, import = {}, invimport = {}}
 	return s2
 end
 function loadClassInternal(path)
-	logp("loadClassInternal: ", path)
+	log("loadClassInternal: ", path)
 	local c = readFile(path)
 	local ok, err = loadstring(c, fs.getName(path))
-	local class = loadClassSpecs(ass(ok, "Error loading class \""..path.."\": "..(err or "nil"), 2), path)
-	local classpath = class.package .. "." .. fs.getName(path):match("^([^%.]*).*$") -- match everything before an optional point
-	cmap[classpath] = class
-
-	local function ser(t, ind)
-		for a, b in pairs(t) do
-			if type(b) == "table" then
-				logp((" "):rep(ind)..tostring(a).." = "..tostring(b.name or b))
-				ser(b, ind+4)
-			else
-				logp((" "):rep(ind)..tostring(a).." = "..tostring(b))
-			end
-		end
+	ass(ok, "Error loading file "..path..": "..(err or "nil"), 2)
+	local cname = fs.getName(path):match("^([^%.]*).*$")
+	local class = loadClassSpecs(ass(ok, "Error loading class \""..path.."\": "..(err or "nil"), 2), path, cname)
+	local classpath = class.package .. "." .. cname -- match everything before an optional point
+	if class.methods[cname] then
+		class.constructor = class.methods[cname]
+		class.methods[cname] = nil
 	end
-	ser(class, 0)
+	if class.cinit then
+		addStaticInit(classpath)
+	end
+	cmap[classpath] = class
+	cmap[classpath].cname = cname
 end
 function loadAssetInternal(path)
 	err("Operation not supported: loadAssetInternal", 2)
@@ -568,7 +1425,7 @@ function loadDirectoryInternal(path)
 	ass(fs.exists(path) and fs.isDir(path), "directory argument is not an existing directory: "..path, 2)
 	for _, n in pairs(fs.list(path)) do
 		n = fs.combine(path, n)
-		if not preloads.assets[n] and not preloads.archives[n] then
+		if not preloads.assets[n] and not preloads.archives[n] and preloads.metainf ~= n then
 			if isFile(n) then
 				loadClassInternal(n)
 			else
@@ -587,8 +1444,59 @@ function loadMetainfInternal(path)
 		meta.MAIN = metainf.MAIN
 	end
 end
+function loadNatives()
+	cmap["one.Native"] = {
+		parent = "one.Object",
+		fields = {},
+		methods = {},
+		import = {},
+		invimport = {},
+		package = "one",
+		cname = "Native"
+	}
+	cmap["one.Object"] = {
+		parent = nil,
+		fields = {},
+		methods = {},
+		import = {},
+		invimport = {},
+		package = "one",
+		cname = "Object"
+	}
+	cmap["one.Main"] = {
+		parent = "one.Object",
+		fields = {},
+		methods = {
+			main = {
+				string = false,
+				method = false,
+				class = false,
+				number = false,
+				table = false,
+				void = true,
+				none = true,
+				tables = {},
+				
+				static = true,
+				args = {},
+				final = false,
+				ismethod = true,
+				public = 3,
+				varargs = false,
+				value = function()
+					logp "main method called"
+				end
+			}
+		},
+		import = {},
+		invimport = {},
+		package = "one",
+		cname = "Main"
+	}
+end
 
 function loadInternal()
+	loadNatives()
 	for path, _ in pairs(preloads.classes) do
 		loadClassInternal(path)
 	end
@@ -612,7 +1520,11 @@ end
 
 function runInternal()
 	--err("Operation not supported: runInternal", 2)
-
+	ass(cmap[meta.MAIN], "No such main class: "..meta.MAIN, 2)
+	ass(getMethods(meta.MAIN).main, "No main method in main class "..meta.MAIN, 2)
+	ass(checkAccess("one.Native", meta.MAIN, "main"), "one.Native can't access "..meta.MAIN..".main", 2)
+	ass(getMethods(meta.MAIN).main.static, "main method is not static: "..meta.MAIN..".main", 2)
+	return invokeMethodStatic(meta.MAIN, "main", {})
 end
 
 
@@ -679,6 +1591,7 @@ end
 function run()
 	assert(state == 2, "state ~= loaded", 2)
 	state = 3
-
+	
+	staticInit()
 	runInternal()
 end

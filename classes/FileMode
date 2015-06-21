@@ -1,0 +1,10 @@
+package "ardera.io.filesystem";
+
+(public - static - final - FileMode) "write";	-- FileMode should be a valid type
+
+private : FileMode(string);
+
+static(function()
+	
+	
+end)

@@ -1,0 +1,13 @@
+package "ardera.test";
+
+import "ardera.io.filesystem.FileWriter";
+import "ardera.io.filesystem.FileMode";
+
+(public - static - var) "filewriter";
+
+(public - static - void) : main();
+function main()
+	filewriter = FileWriter("baba")
+	filewriter.write("Hey")
+	filewriter.close()
+end

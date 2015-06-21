@@ -1,6 +1,7 @@
 os.loadAPI "cload"
 cload.startLoading "/classes/"
 
+cload.loadMetainf "METAINF"
 cload.loadDirectory()
 
 cload.load()
